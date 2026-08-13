@@ -1,123 +1,151 @@
-"""Order processing service — the BEFORE version with deliberate problems."""
+"""Order processing service."""
 
 import json
+import logging
 import smtplib
-from email.mime.text import MIMEText
 from datetime import datetime
+from email.mime.text import MIMEText
 
+logger = logging.getLogger(__name__)
 
-# Global config — no dependency injection
 DB_HOST = "prod-db.internal"
+DB_NAME = "orders"
 SMTP_HOST = "mail.internal"
+SENDER_EMAIL = "shop@example.com"
 TAX_RATE = 0.19
+
+REQUIRED_ORDER_FIELDS = ("customer_email", "items")
+REQUIRED_ITEM_FIELDS = ("name", "price", "quantity")
 
 
 def process_order(order_data, db_connection=None):
     """Process an incoming order: validate, store, send confirmation email."""
-
-    # --- Validation (duplicated logic, no early returns) ---
-    errors = []
-    if "customer_email" not in order_data:
-        errors.append("missing email")
-    if "items" not in order_data:
-        errors.append("missing items")
-    if len(errors) > 0:
-        print("Validation failed: " + str(errors))
+    errors = _validate_order(order_data)
+    if errors:
+        logger.warning("Validation failed: %s", errors)
         return {"status": "error", "errors": errors}
 
-    # Check each item
-    for item in order_data["items"]:
-        if "name" not in item:
-            errors.append("item missing name")
-        if "price" not in item:
-            errors.append("item missing price")
-        if "quantity" not in item:
-            errors.append("item missing quantity")
-        # Duplicate: check again after the loop
-    if len(errors) > 0:
-        print("Validation failed: " + str(errors))
-        return {"status": "error", "errors": errors}
+    subtotal, tax, total = _calculate_totals(order_data["items"])
 
-    # --- Price calculation (inline, no helper, tax logic mixed in) ---
-    subtotal = 0
-    for item in order_data["items"]:
-        item_total = item["price"] * item["quantity"]
-        subtotal = subtotal + item_total
-    tax = subtotal * TAX_RATE
-    total = subtotal + tax
+    db_connection = db_connection or _connect_db()
+    order_id = _store_order(db_connection, order_data, subtotal, tax, total)
 
-    # --- Store to database (raw SQL, no error handling) ---
-    if db_connection is None:
-        import psycopg2
-        db_connection = psycopg2.connect(host=DB_HOST, database="orders")
+    _send_confirmation_email(
+        order_data["customer_email"], order_id, order_data["items"], subtotal, tax, total
+    )
+
+    logger.info("Order %s processed successfully", order_id)
+    return {"status": "success", "order_id": order_id, "total": total}
+
+
+def get_order_summary(order_id, db_connection=None):
+    """Get a formatted summary of a stored order, or None if not found."""
+    db_connection = db_connection or _connect_db()
 
     cursor = db_connection.cursor()
     cursor.execute(
-        "INSERT INTO orders (customer_email, items_json, subtotal, tax, total, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
-        (order_data["customer_email"], json.dumps(order_data["items"]), subtotal, tax, total, datetime.now())
+        "SELECT customer_email, items_json, subtotal, tax, total FROM orders WHERE id = %s",
+        (order_id,),
+    )
+    row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    customer_email, items_json, subtotal, tax, total = row
+
+    return {
+        "order_id": order_id,
+        "customer_email": customer_email,
+        "items_formatted": _format_items(json.loads(items_json)),
+        "subtotal": _format_amount(subtotal),
+        "tax": _format_amount(tax),
+        "total": _format_amount(total),
+    }
+
+
+def _validate_order(order_data):
+    """Return a list of validation errors (empty if the order is valid)."""
+    errors = [
+        f"missing {field.replace('customer_', '')}"
+        for field in REQUIRED_ORDER_FIELDS
+        if field not in order_data
+    ]
+    if errors:
+        return errors
+
+    for item in order_data["items"]:
+        errors.extend(
+            f"item missing {field}" for field in REQUIRED_ITEM_FIELDS if field not in item
+        )
+    return errors
+
+
+def _calculate_totals(items):
+    """Return (subtotal, tax, total) for the given items."""
+    subtotal = sum(item["price"] * item["quantity"] for item in items)
+    tax = subtotal * TAX_RATE
+    return subtotal, tax, subtotal + tax
+
+
+def _connect_db():
+    import psycopg2
+
+    return psycopg2.connect(host=DB_HOST, database=DB_NAME)
+
+
+def _store_order(db_connection, order_data, subtotal, tax, total):
+    """Insert the order and return its id."""
+    cursor = db_connection.cursor()
+    cursor.execute(
+        "INSERT INTO orders (customer_email, items_json, subtotal, tax, total, created_at)"
+        " VALUES (%s, %s, %s, %s, %s, %s)",
+        (
+            order_data["customer_email"],
+            json.dumps(order_data["items"]),
+            subtotal,
+            tax,
+            total,
+            datetime.now(),
+        ),
     )
     db_connection.commit()
-    order_id = cursor.lastrowid
+    return cursor.lastrowid
 
-    # --- Send confirmation email (inline, no template, duplicated formatting) ---
-    items_text = ""
-    for item in order_data["items"]:
-        items_text += f"  - {item['name']}: {item['quantity']}x {item['price']:.2f} EUR\n"
 
-    email_body = f"""Dear Customer,
+def _format_amount(amount):
+    return f"{amount:.2f} EUR"
+
+
+def _format_items(items):
+    return "".join(
+        f"  - {item['name']}: {item['quantity']}x {item['price']:.2f} EUR\n" for item in items
+    )
+
+
+def _send_confirmation_email(recipient, order_id, items, subtotal, tax, total):
+    body = f"""Dear Customer,
 
 Thank you for your order #{order_id}!
 
 Your items:
-{items_text}
-Subtotal: {subtotal:.2f} EUR
-Tax (19%): {tax:.2f} EUR
-Total: {total:.2f} EUR
+{_format_items(items)}
+Subtotal: {_format_amount(subtotal)}
+Tax ({TAX_RATE:.0%}): {_format_amount(tax)}
+Total: {_format_amount(total)}
 
 We will process your order shortly.
 
 Best regards,
 The Shop Team"""
 
-    msg = MIMEText(email_body)
+    msg = MIMEText(body)
     msg["Subject"] = f"Order Confirmation #{order_id}"
-    msg["From"] = "shop@example.com"
-    msg["To"] = order_data["customer_email"]
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = recipient
 
     server = smtplib.SMTP(SMTP_HOST)
-    server.send_message(msg)
-    server.quit()
-
-    print(f"Order {order_id} processed successfully")
-    return {"status": "success", "order_id": order_id, "total": total}
-
-
-def get_order_summary(order_id, db_connection=None):
-    """Get order summary — duplicates price formatting from above."""
-
-    if db_connection is None:
-        import psycopg2
-        db_connection = psycopg2.connect(host=DB_HOST, database="orders")
-
-    cursor = db_connection.cursor()
-    cursor.execute("SELECT customer_email, items_json, subtotal, tax, total FROM orders WHERE id = %s", (order_id,))
-    row = cursor.fetchone()
-
-    if row is None:
-        return None
-
-    items = json.loads(row[1])
-
-    # Duplicated formatting logic
-    items_text = ""
-    for item in items:
-        items_text += f"  - {item['name']}: {item['quantity']}x {item['price']:.2f} EUR\n"
-
-    return {
-        "order_id": order_id,
-        "customer_email": row[0],
-        "items_formatted": items_text,
-        "subtotal": f"{row[2]:.2f} EUR",
-        "tax": f"{row[3]:.2f} EUR",
-        "total": f"{row[4]:.2f} EUR",
-    }
+    try:
+        server.send_message(msg)
+    finally:
+        server.quit()
