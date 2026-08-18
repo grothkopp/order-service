@@ -92,6 +92,49 @@ The Shop Team"""
     return {"status": "success", "order_id": order_id, "total": total}
 
 
+def cancel_order(order_id, db_connection=None):
+    """Cancel an order and send a cancellation email to the customer."""
+
+    if db_connection is None:
+        import psycopg2
+        db_connection = psycopg2.connect(host=DB_HOST, database="orders")
+
+    cursor = db_connection.cursor()
+    cursor.execute("SELECT customer_email, status FROM orders WHERE id = %s", (order_id,))
+    row = cursor.fetchone()
+
+    if row is None:
+        return {"status": "error", "errors": ["order not found"]}
+
+    customer_email, current_status = row
+    if current_status == "cancelled":
+        return {"status": "error", "errors": ["order already cancelled"]}
+
+    cursor.execute("UPDATE orders SET status = %s WHERE id = %s", ("cancelled", order_id))
+    db_connection.commit()
+
+    email_body = f"""Dear Customer,
+
+Your order #{order_id} has been cancelled.
+
+If you did not request this cancellation, please contact us if you have any questions.
+
+Best regards,
+The Shop Team"""
+
+    msg = MIMEText(email_body)
+    msg["Subject"] = f"Order Cancellation #{order_id}"
+    msg["From"] = "shop@example.com"
+    msg["To"] = customer_email
+
+    server = smtplib.SMTP(SMTP_HOST)
+    server.send_message(msg)
+    server.quit()
+
+    print(f"Order {order_id} cancelled successfully")
+    return {"status": "success", "order_id": order_id}
+
+
 def get_order_summary(order_id, db_connection=None):
     """Get order summary — duplicates price formatting from above."""
 
